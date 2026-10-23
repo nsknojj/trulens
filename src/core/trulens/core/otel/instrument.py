@@ -82,6 +82,7 @@ from trulens.otel.semconv.constants import (
     TRULENS_RECORD_ROOT_INSTRUMENT_WRAPPER_FLAG,
 )
 from trulens.otel.semconv.constants import TRULENS_SPAN_END_CALLBACKS
+from trulens.otel.semconv.trace import GenAIAttributes
 from trulens.otel.semconv.trace import ResourceAttributes
 from trulens.otel.semconv.trace import SpanAttributes
 import wrapt
@@ -1095,6 +1096,17 @@ class OtelRecordingContext(OtelBaseRecordingContext):
         self.attach_to_context(
             ResourceAttributes.APP_ID, self.app_id, override=True
         )
+        # GenAI-standard spellings, so outbound baggage and spans carry the
+        # app identity for consumers that only know the OTel conventions.
+        self.attach_to_context(
+            GenAIAttributes.AGENT.NAME, self.app_name, override=True
+        )
+        self.attach_to_context(
+            GenAIAttributes.AGENT.VERSION, self.app_version, override=True
+        )
+        self.attach_to_context(
+            GenAIAttributes.AGENT.ID, self.app_id, override=True
+        )
         # Attach self so child spans can register baggage tokens for cleanup at app exit.
         self.attach_to_context("__trulens_otel_ctx__", self, override=True)
         self.attach_to_context(SpanAttributes.RUN_NAME, self.run_name)
@@ -1114,6 +1126,9 @@ class OtelRecordingContext(OtelBaseRecordingContext):
         if self.conversation_id is not None:
             self.attach_to_context(
                 SpanAttributes.CONVERSATION_ID, self.conversation_id
+            )
+            self.attach_to_context(
+                GenAIAttributes.CONVERSATION.ID, self.conversation_id
             )
 
         self.recording = Recording(self.tru_app)
@@ -1150,6 +1165,9 @@ class OtelFeedbackComputationRecordingContext(OtelBaseRecordingContext):
         if self.conversation_id is not None:
             self.attach_to_context(
                 SpanAttributes.CONVERSATION_ID, self.conversation_id
+            )
+            self.attach_to_context(
+                GenAIAttributes.CONVERSATION.ID, self.conversation_id
             )
         self.attach_to_context(
             SpanAttributes.EVAL.METRIC_NAME, self.feedback_name

@@ -15,27 +15,113 @@ built in one of those processes belong in the trace the agent already started.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Mapping, MutableMapping, Optional
+from urllib.parse import urlparse
 
+from opentelemetry.baggage import clear
+from opentelemetry.baggage import get_all
+from opentelemetry.baggage import set_baggage
 from opentelemetry.context import Context
+from opentelemetry.context import get_current
 from opentelemetry.propagate import extract
 from opentelemetry.propagate import inject
 from opentelemetry.trace import SpanContext
 from opentelemetry.trace import get_current_span
+from trulens.otel.semconv.trace import GenAIAttributes
 
 if TYPE_CHECKING:
     import httpx
 
 
-def inject_trace_context(headers: MutableMapping[str, str]) -> bool:
+# Baggage keys that may leave the process. Anything else in baggage (record
+# ids, internal objects, user-attached keys) is never sent over HTTP.
+ALLOWED_BAGGAGE_KEYS = frozenset([
+    GenAIAttributes.CONVERSATION.ID,
+    GenAIAttributes.AGENT.NAME,
+    GenAIAttributes.AGENT.VERSION,
+    GenAIAttributes.AGENT.ID,
+])
+
+# Maximum length, in characters, of a single propagated baggage value.
+MAX_BAGGAGE_VALUE_LEN = 256
+
+# Comma-separated hosts that may receive baggage. When set it replaces the
+# defaults derived from `_DEFAULT_HOST_ENV_VARS`.
+PROPAGATION_HOSTS_ENV_VAR = "TRULENS_PROPAGATION_HOSTS"
+
+# Environment variables holding the OTLP endpoint and provider base URLs whose
+# hosts receive baggage when `TRULENS_PROPAGATION_HOSTS` is unset.
+_DEFAULT_HOST_ENV_VARS = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "ANTHROPIC_BASE_URL",
+    "AZURE_OPENAI_ENDPOINT",
+    "GOOGLE_API_BASE_URL",
+)
+
+
+def _host_of(value: str) -> Optional[str]:
+    """Lowercased hostname of a URL or bare host name, if there is one."""
+    value = value.strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = "//" + value
+    try:
+        host = urlparse(value).hostname
+    except ValueError:
+        return None
+    return host.lower() if host else None
+
+
+def _propagation_hosts() -> frozenset:
+    """Hosts that may receive baggage."""
+    configured = os.environ.get(PROPAGATION_HOSTS_ENV_VAR)
+    values = (
+        configured.split(",")
+        if configured is not None
+        else [os.environ.get(name, "") for name in _DEFAULT_HOST_ENV_VARS]
+    )
+    return frozenset(host for host in map(_host_of, values) if host)
+
+
+def _should_propagate_to_host(target_url: str) -> bool:
+    """Whether baggage may be sent to the host of `target_url`."""
+    host = _host_of(target_url)
+    return host is not None and host in _propagation_hosts()
+
+
+def _filter_baggage() -> dict[str, str]:
+    """The allowlisted baggage entries of the current context, length-capped."""
+    return {
+        key: str(value)[:MAX_BAGGAGE_VALUE_LEN]
+        for key, value in get_all().items()
+        if key in ALLOWED_BAGGAGE_KEYS and value is not None
+    }
+
+
+def inject_trace_context(
+    headers: MutableMapping[str, str], target_url: Optional[str] = None
+) -> bool:
     """Inject the active span's trace context into `headers`.
 
     Uses the globally configured propagators, so a `traceparent` header is
     written when the default W3C propagator is installed, and nothing is
     written when the span context is invalid or propagation is disabled.
 
+    Baggage is the one thing restricted beyond that. Baggage reaches every host
+    an HTTP client calls, so it is dropped unless `target_url` is given and its
+    host is allowed (see `TRULENS_PROPAGATION_HOSTS`), and even then only the
+    `ALLOWED_BAGGAGE_KEYS` entries are sent, with values length-capped and
+    percent-encoded per the W3C baggage format.
+
     Args:
         headers: Mutable header mapping to write into, modified in place.
+        target_url: URL the request is going to, used to decide whether
+            baggage may be included. Without it no baggage is written.
 
     Returns:
         True when the configured propagators actually wrote something.
@@ -44,11 +130,19 @@ def inject_trace_context(headers: MutableMapping[str, str]) -> bool:
     if not get_current_span().get_span_context().is_valid:
         return False
 
+    # Serialize from a context whose baggage has been replaced by the allowed
+    # entries, so the configured propagators do the encoding and size limiting
+    # and a deployment without a baggage propagator still sends none.
+    outbound = clear(get_current())
+    if target_url and _should_propagate_to_host(target_url):
+        for key, value in _filter_baggage().items():
+            outbound = set_baggage(key, value, outbound)
+
     # Inject into a scratch mapping first. With a no-op propagator installed the
     # span context is valid but nothing is written, and the return value should
     # say so rather than report an injection that did not happen.
     injected: dict[str, str] = {}
-    inject(injected)
+    inject(injected, context=outbound)
     if not injected:
         return False
 
@@ -127,7 +221,7 @@ def tracing_transport(inner: Optional[Any] = None) -> Any:
             )
 
         def handle_request(self, request: httpx.Request) -> httpx.Response:
-            inject_trace_context(request.headers)
+            inject_trace_context(request.headers, str(request.url))
             return self._inner.handle_request(request)
 
         def close(self) -> None:
@@ -178,7 +272,7 @@ def async_tracing_transport(inner: Optional[Any] = None) -> Any:
         async def handle_async_request(
             self, request: httpx.Request
         ) -> httpx.Response:
-            inject_trace_context(request.headers)
+            inject_trace_context(request.headers, str(request.url))
             return await self._inner.handle_async_request(request)
 
         async def aclose(self) -> None:

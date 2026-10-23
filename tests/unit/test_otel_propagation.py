@@ -7,9 +7,14 @@ sync and async httpx transports that apply it to every outbound request.
 """
 
 import asyncio
+import os
 import unittest
+from unittest import mock
 
 import httpx
+from opentelemetry import baggage
+from opentelemetry import context as context_api
+from opentelemetry.baggage.propagation import W3CBaggagePropagator
 from opentelemetry.context import Context
 from opentelemetry.propagate import set_global_textmap
 from opentelemetry.propagators.textmap import TextMapPropagator
@@ -275,6 +280,173 @@ class TestAsyncTracingTransport(_TracingTestCase):
         asyncio.run(transport.aclose())
 
         self.assertTrue(inner.closed)
+
+
+_CONV = "gen_ai.conversation.id"
+_AGENT = "gen_ai.agent.name"
+
+
+class TestBaggagePropagation(_TracingTestCase):
+    """Baggage leaves the process only to allowed hosts and only as allowlisted
+    GenAI keys."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        env = mock.patch.dict(os.environ, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in (
+            propagation.PROPAGATION_HOSTS_ENV_VAR,
+            *propagation._DEFAULT_HOST_ENV_VARS,
+        ):
+            os.environ.pop(name, None)
+
+    def inject(self, url, **entries) -> dict:
+        ctx = context_api.get_current()
+        for key, value in entries.items():
+            ctx = baggage.set_baggage(key.replace("__", "."), value, ctx)
+        token = context_api.attach(ctx)
+        try:
+            with self.tracer.start_as_current_span("outbound"):
+                headers = {}
+                propagation.inject_trace_context(headers, url)
+        finally:
+            context_api.detach(token)
+        return headers
+
+    def test_no_baggage_by_default(self) -> None:
+        headers = self.inject(
+            "https://api.example.com/v1", gen_ai__conversation__id="c"
+        )
+        self.assertIn("traceparent", headers)
+        self.assertNotIn("baggage", headers)
+
+    def test_no_baggage_without_a_target_url(self) -> None:
+        os.environ["TRULENS_PROPAGATION_HOSTS"] = "api.example.com"
+        headers = self.inject(None, gen_ai__conversation__id="c")
+        self.assertNotIn("baggage", headers)
+
+    def test_allowed_host_gets_only_allowlisted_keys(self) -> None:
+        os.environ["TRULENS_PROPAGATION_HOSTS"] = "api.example.com"
+        headers = self.inject(
+            "https://api.example.com/v1",
+            gen_ai__conversation__id="support-42",
+            gen_ai__agent__name="bot",
+            ai__observability__record_id="secret",
+            other="x",
+        )
+        entries = dict(p.split("=", 1) for p in headers["baggage"].split(","))
+        self.assertEqual({_CONV: "support-42", _AGENT: "bot"}, entries)
+
+    def test_other_host_gets_no_baggage(self) -> None:
+        os.environ["TRULENS_PROPAGATION_HOSTS"] = "api.example.com"
+        for url in (
+            "https://evil.example.org/v1",
+            "https://api.example.com.evil.org/v1",
+            "https://sub.api.example.com/v1",
+        ):
+            with self.subTest(url=url):
+                headers = self.inject(url, gen_ai__conversation__id="c")
+                self.assertNotIn("baggage", headers)
+
+    def test_host_match_is_case_insensitive_and_ignores_port_and_scheme(
+        self,
+    ) -> None:
+        os.environ["TRULENS_PROPAGATION_HOSTS"] = (
+            "API.Example.com, https://other.test:8443"
+        )
+        for url in ("https://api.example.COM:8080/x", "http://other.test/x"):
+            with self.subTest(url=url):
+                headers = self.inject(url, gen_ai__conversation__id="c")
+                self.assertIn("baggage", headers)
+
+    def test_defaults_to_otlp_endpoint_and_provider_base_urls(self) -> None:
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://collector.test:4318"
+        os.environ["OPENAI_BASE_URL"] = "https://gateway.test/v1"
+        for url in (
+            "http://collector.test:4318/v1/traces",
+            "https://gateway.test/v1/chat",
+        ):
+            with self.subTest(url=url):
+                headers = self.inject(url, gen_ai__conversation__id="c")
+                self.assertIn("baggage", headers)
+        self.assertNotIn(
+            "baggage",
+            self.inject(
+                "https://elsewhere.test/", gen_ai__conversation__id="c"
+            ),
+        )
+
+    def test_explicit_hosts_replace_the_defaults(self) -> None:
+        os.environ["OPENAI_BASE_URL"] = "https://gateway.test/v1"
+        os.environ["TRULENS_PROPAGATION_HOSTS"] = "api.example.com"
+        headers = self.inject(
+            "https://gateway.test/v1", gen_ai__conversation__id="c"
+        )
+        self.assertNotIn("baggage", headers)
+
+    def test_empty_hosts_value_disables_baggage(self) -> None:
+        os.environ["OPENAI_BASE_URL"] = "https://gateway.test/v1"
+        os.environ["TRULENS_PROPAGATION_HOSTS"] = ""
+        headers = self.inject(
+            "https://gateway.test/v1", gen_ai__conversation__id="c"
+        )
+        self.assertNotIn("baggage", headers)
+
+    def test_values_are_length_limited(self) -> None:
+        os.environ["TRULENS_PROPAGATION_HOSTS"] = "api.example.com"
+        headers = self.inject(
+            "https://api.example.com/", gen_ai__conversation__id="a" * 10_000
+        )
+        value = headers["baggage"].split("=", 1)[1]
+        self.assertEqual("a" * propagation.MAX_BAGGAGE_VALUE_LEN, value)
+
+    def test_values_are_percent_encoded(self) -> None:
+        os.environ["TRULENS_PROPAGATION_HOSTS"] = "api.example.com"
+        headers = self.inject(
+            "https://api.example.com/",
+            gen_ai__agent__name="my app, v2;x=y\r\nX: 1",
+        )
+        header = headers["baggage"]
+        self.assertEqual(1, header.count("="))
+        for bad in (",", ";", "\r", "\n", " "):
+            self.assertNotIn(bad, header)
+        parsed = baggage.get_all(
+            W3CBaggagePropagator().extract({"baggage": header})
+        )
+        self.assertEqual("my app, v2;x=y\r\nX: 1", parsed[_AGENT])
+
+    def test_traceparent_is_unaffected_by_baggage_filtering(self) -> None:
+        headers = self.inject(
+            "https://elsewhere.test/", gen_ai__conversation__id="c"
+        )
+        self.assertIn("traceparent", headers)
+
+    def test_transport_applies_the_host_check(self) -> None:
+        os.environ["TRULENS_PROPAGATION_HOSTS"] = "allowed.test"
+        recorded = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            recorded.append(dict(request.headers))
+            return httpx.Response(200)
+
+        client = httpx.Client(
+            transport=propagation.tracing_transport(
+                httpx.MockTransport(handler)
+            )
+        )
+        token = context_api.attach(
+            baggage.set_baggage(_CONV, "c", context_api.get_current())
+        )
+        try:
+            with self.tracer.start_as_current_span("outbound"):
+                client.get("https://allowed.test/x")
+                client.get("https://denied.test/x")
+        finally:
+            context_api.detach(token)
+
+        self.assertEqual(f"{_CONV}=c", recorded[0]["baggage"])
+        self.assertNotIn("baggage", recorded[1])
 
 
 class _CloseSpy(httpx.MockTransport):

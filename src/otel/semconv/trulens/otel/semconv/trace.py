@@ -36,6 +36,18 @@ class GenAIAttributes:
     See: https://opentelemetry.io/docs/specs/semconv/gen-ai/
     """
 
+    class AGENT:
+        """Attributes identifying the agent/application."""
+
+        ID = GEN_AI_SCOPE + ".agent.id"
+        """Identifier of the agent."""
+
+        NAME = GEN_AI_SCOPE + ".agent.name"
+        """Name of the agent."""
+
+        VERSION = GEN_AI_SCOPE + ".agent.version"
+        """Version of the agent."""
+
     class CONVERSATION:
         """Attributes identifying the conversation a request belongs to."""
 

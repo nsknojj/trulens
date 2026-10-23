@@ -169,6 +169,14 @@ def set_general_span_attributes(
     set_string_span_attribute_from_baggage(
         span, SpanAttributes.CONVERSATION_ID, context
     )
+    # GenAI-standard spellings of the identity keys above.
+    for key in (
+        GenAIAttributes.CONVERSATION.ID,
+        GenAIAttributes.AGENT.NAME,
+        GenAIAttributes.AGENT.VERSION,
+        GenAIAttributes.AGENT.ID,
+    ):
+        set_string_span_attribute_from_baggage(span, key, context)
     # SPAN_GROUPS is read from a ContextVar (not baggage) and stored as a
     # list attribute.  The ContextVar is managed by span_group() in
     # trulens.core.otel.instrument.
